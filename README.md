@@ -1,6 +1,37 @@
 # mail_bomber
 Это скрипт на Python для массовой рассылки email-писем с поддержкой keep-alive соединений, HTML-шаблонов и вложений (doc, pdf, zip). Он подключается к SMTP-серверам (SSL/STARTTLS), умеет переподключаться при обрывах и выполнять умные задержки с NOOP-пингами, что делает его эффективным инструментом для автоматизированной email-бомбардировки.
 
+# Usage
+```
+    ╔══════════════════════════════════════╗
+    ║     Феня's Email Bomber v3.0         ║
+    ║   "Keep-alive like a hacker boss!"   ║
+    ╚══════════════════════════════════════╝
+    
+usage: mail_bomber.py [-h] -e EMAILS -d DELAY -s SMTP_SERVER [--port PORT] [-u USER] [-p PASSWORD] -f MAIL_FROM -t TEMPLATE [--subject SUBJECT] [-a ATTACHMENTS]
+
+Массовая рассылка писем с keep-alive
+
+options:
+  -h, --help            show this help message and exit
+  -e, --emails EMAILS   Файл с email адресами
+  -d, --delay DELAY     Задержка между отправками (секунды)
+  -s, --smtp-server SMTP_SERVER
+                        SMTP сервер (host или host:port, напр. exchange.local:465)
+  --port PORT           Порт SMTP (если не указан в -s). 465=SSL, 587=STARTTLS, 25=plain
+  -u, --user USER       SMTP логин (опусти для relay без auth)
+  -p, --password PASSWORD
+                        SMTP пароль
+  -f, --mail-from MAIL_FROM
+                        Email отправителя
+  -t, --template TEMPLATE
+                        HTML файл с шаблоном письма
+  --subject SUBJECT     Тема письма
+  -a, --attach ATTACHMENTS
+                        Файл для вложения (.doc, .pdf, .zip и т.д.). Можно указать несколько раз: -a file.doc -a doc2.pdf
+```                        
+
+# Пример использования
 ```
 python3 mail_bomber.py -e /home/akuma0xdead/stf365/metal/emails -d 3 -s 10.124.5.11:25 -u '' -p '' -f agent@x.stf -t /home/akuma0xdead/stf365/metal/kib3rs.html -a /home/akuma0xdead/stf365/icg/kib3rs.doc --subject "Важная информация"
 
